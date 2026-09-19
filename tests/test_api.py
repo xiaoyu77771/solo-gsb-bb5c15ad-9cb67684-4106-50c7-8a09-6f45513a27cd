@@ -1,4 +1,4 @@
-"""HTTP-level tests for POST /occurrences and /health."""
+"""HTTP-level tests for POST /occurrences, /business-occurrences and /health."""
 
 from __future__ import annotations
 
@@ -12,6 +12,10 @@ client = TestClient(app)
 
 def post(body: dict):
     return client.post("/occurrences", json=body)
+
+
+def post_business(body: dict):
+    return client.post("/business-occurrences", json=body)
 
 
 @pytest.fixture(scope="module")
@@ -630,3 +634,341 @@ def test_dense_rule_starting_far_before_window_rejected_quickly(api):
     )
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "too_many_occurrences"
+
+
+# --------------------------------------------- POST /business-occurrences ----
+
+
+_BUSINESS_BASE = {
+    "timezone": "UTC",
+    "start_local": "2025-01-02T09:00:00",  # Thursday
+    "rrule": "FREQ=DAILY;COUNT=4",         # Thu 2, Fri 3, Sat 4, Sun 5
+    "interval_start": "2025-01-01T00:00:00Z",
+    "interval_end": "2025-01-10T00:00:00Z",
+}
+
+
+def test_business_following_merges_weekend_onto_next_monday(api):
+    resp = post_business(dict(_BUSINESS_BASE))
+    assert resp.status_code == 200
+    occ = resp.json()["occurrences"]
+    assert [(o["local"], o["utc"], o["originals"]) for o in occ] == [
+        ("2025-01-02T09:00:00", "2025-01-02T09:00:00Z", ["2025-01-02T09:00:00"]),
+        ("2025-01-03T09:00:00", "2025-01-03T09:00:00Z", ["2025-01-03T09:00:00"]),
+        (
+            "2025-01-06T09:00:00",
+            "2025-01-06T09:00:00Z",
+            ["2025-01-04T09:00:00", "2025-01-05T09:00:00"],
+        ),
+    ]
+    assert all(set(o) == {"local", "utc", "utc_offset", "dst", "fold", "originals"} for o in occ)
+    assert all(o["local"].endswith("T09:00:00") for o in occ)
+
+
+def test_business_preceding_merges_weekend_back_to_friday(api):
+    resp = post_business({**_BUSINESS_BASE, "business_day_convention": "preceding"})
+    assert resp.status_code == 200
+    occ = resp.json()["occurrences"]
+    assert [(o["local"], o["originals"]) for o in occ] == [
+        ("2025-01-02T09:00:00", ["2025-01-02T09:00:00"]),
+        (
+            "2025-01-03T09:00:00",
+            ["2025-01-03T09:00:00", "2025-01-04T09:00:00", "2025-01-05T09:00:00"],
+        ),
+    ]
+
+
+def test_business_modified_following_goes_backward_on_month_cross(api):
+    # Fri May 30, Sat May 31, Sun Jun 1: the weekend raw instances would move
+    # forward into June, so modified_following moves them backward instead.
+    resp = post_business(
+        {
+            "timezone": "UTC",
+            "start_local": "2025-05-30T09:00:00",
+            "rrule": "FREQ=DAILY;COUNT=3",
+            "business_day_convention": "modified_following",
+            "interval_start": "2025-05-29T00:00:00Z",
+            "interval_end": "2025-06-03T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    occ = resp.json()["occurrences"]
+    assert [(o["local"], o["originals"]) for o in occ] == [
+        (
+            "2025-05-30T09:00:00",
+            ["2025-05-30T09:00:00", "2025-05-31T09:00:00"],
+        ),
+        # Sunday Jun 1 rolls forward to Mon Jun 2: no month crossing for that raw date.
+        ("2025-06-02T09:00:00", ["2025-06-01T09:00:00"]),
+    ]
+
+
+def test_business_modified_following_stays_forward_within_month(api):
+    # Fri Feb 14 + weekend + Mon Feb 17 holiday: all three non-business days
+    # move forward to Tue Feb 18 (same month as each raw date).
+    resp = post_business(
+        {
+            "timezone": "UTC",
+            "start_local": "2025-02-14T09:00:00",
+            "rrule": "FREQ=DAILY;COUNT=4",
+            "business_day_convention": "modified_following",
+            "holidays": ["2025-02-17"],
+            "interval_start": "2025-02-13T00:00:00Z",
+            "interval_end": "2025-02-20T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    occ = resp.json()["occurrences"]
+    assert [(o["local"], o["originals"]) for o in occ] == [
+        ("2025-02-14T09:00:00", ["2025-02-14T09:00:00"]),
+        (
+            "2025-02-18T09:00:00",
+            ["2025-02-15T09:00:00", "2025-02-16T09:00:00", "2025-02-17T09:00:00"],
+        ),
+    ]
+
+
+def test_business_holidays_are_skipped_like_weekends(api):
+    resp = post_business(
+        {
+            "timezone": "UTC",
+            "start_local": "2025-01-02T09:00:00",  # Thursday
+            "rrule": "FREQ=DAILY;COUNT=2",         # Thu 2, Fri 3 (holiday)
+            "holidays": ["2025-01-03"],
+            "interval_start": "2025-01-01T00:00:00Z",
+            "interval_end": "2025-01-10T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    occ = resp.json()["occurrences"]
+    assert [(o["local"], o["originals"]) for o in occ] == [
+        ("2025-01-02T09:00:00", ["2025-01-02T09:00:00"]),
+        # Friday holiday + the weekend all land on Monday Jan 6.
+        ("2025-01-06T09:00:00", ["2025-01-03T09:00:00"]),
+    ]
+
+
+def test_business_custom_weekend_days(api):
+    # Friday/Saturday weekend (e.g. parts of the Middle East): Thursday is a
+    # business day, Fri Jan 3 and Sat Jan 4 both move to Sunday Jan 5.
+    resp = post_business(
+        {
+            "timezone": "UTC",
+            "start_local": "2025-01-02T09:00:00",
+            "rrule": "FREQ=DAILY;COUNT=3",  # Thu 2, Fri 3, Sat 4
+            "weekend_days": [5, 6],
+            "interval_start": "2025-01-01T00:00:00Z",
+            "interval_end": "2025-01-10T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    occ = resp.json()["occurrences"]
+    assert [(o["local"], o["originals"]) for o in occ] == [
+        ("2025-01-02T09:00:00", ["2025-01-02T09:00:00"]),
+        (
+            "2025-01-05T09:00:00",
+            ["2025-01-03T09:00:00", "2025-01-04T09:00:00"],
+        ),
+    ]
+
+
+def test_business_holiday_date_time_uses_zone_wall_date(api):
+    resp = post_business(
+        {
+            "timezone": "Asia/Shanghai",
+            "start_local": "2025-01-01T09:00:00",  # holiday
+            "holidays": ["2025-01-01T09:00:00+08:00"],
+            "interval_start": "2025-01-01T00:00:00Z",
+            "interval_end": "2025-01-03T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    assert [(o["local"], o["originals"]) for o in resp.json()["occurrences"]] == [
+        ("2025-01-02T09:00:00", ["2025-01-01T09:00:00"]),
+    ]
+
+
+def test_business_exdate_matches_unadjusted_wall_time(api):
+    # Excluding the raw Saturday instance removes it from the Monday merge;
+    # excluding the adjusted Monday wall time does not.
+    resp = post_business({**_BUSINESS_BASE, "exdate": ["2025-01-04T09:00:00"]})
+    assert resp.status_code == 200
+    monday = [o for o in resp.json()["occurrences"] if o["local"] == "2025-01-06T09:00:00"]
+    assert monday[0]["originals"] == ["2025-01-05T09:00:00"]
+
+    resp = post_business({**_BUSINESS_BASE, "exdate": ["2025-01-06T09:00:00"]})
+    assert resp.status_code == 200
+    locals_ = [o["local"] for o in resp.json()["occurrences"]]
+    assert "2025-01-06T09:00:00" in locals_
+
+
+def test_business_rdate_is_adjusted_and_merges_with_rrule(api):
+    # RDATE Friday Jan 3 09:00 duplicates an rrule instance after adjustment
+    # trivially; here an RDATE on Saturday merges into the Monday instant.
+    resp = post_business(
+        {
+            "timezone": "UTC",
+            "start_local": "2025-01-02T09:00:00",
+            "rrule": "FREQ=DAILY;COUNT=2",  # Thu 2, Fri 3
+            "rdate": ["2025-01-04T09:00:00", "2025-01-05T09:00:00"],
+            "interval_start": "2025-01-01T00:00:00Z",
+            "interval_end": "2025-01-10T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    occ = resp.json()["occurrences"]
+    assert [(o["local"], o["originals"]) for o in occ] == [
+        ("2025-01-02T09:00:00", ["2025-01-02T09:00:00"]),
+        ("2025-01-03T09:00:00", ["2025-01-03T09:00:00"]),
+        (
+            "2025-01-06T09:00:00",
+            ["2025-01-04T09:00:00", "2025-01-05T09:00:00"],
+        ),
+    ]
+
+
+def test_business_no_rrule_still_adjusts_dtstart(api):
+    resp = post_business(
+        {
+            "timezone": "UTC",
+            "start_local": "2025-01-04T09:00:00",  # Saturday
+            "interval_start": "2025-01-01T00:00:00Z",
+            "interval_end": "2025-01-10T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    assert [(o["local"], o["originals"]) for o in resp.json()["occurrences"]] == [
+        ("2025-01-06T09:00:00", ["2025-01-04T09:00:00"]),
+    ]
+
+
+def test_business_preserves_subsecond_time_of_day(api):
+    resp = post_business(
+        {
+            "timezone": "UTC",
+            "start_local": "2025-01-04T09:00:00.250000",  # Saturday
+            "interval_start": "2025-01-01T00:00:00Z",
+            "interval_end": "2025-01-10T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    (o,) = resp.json()["occurrences"]
+    assert o["local"] == "2025-01-06T09:00:00.250000"
+    assert o["utc"] == "2025-01-06T09:00:00.250000Z"
+
+
+def test_business_dst_resolution_runs_after_adjustment(api):
+    # New York: Saturday Mar 8 moves (weekend_days=[6]) onto Sunday Mar 9;
+    # 02:30 does not exist there. Default gap policy skips it...
+    resp = post_business(
+        {
+            "timezone": "America/New_York",
+            "start_local": "2025-03-08T02:30:00",
+            "weekend_days": [6],
+            "interval_start": "2025-03-07T00:00:00Z",
+            "interval_end": "2025-03-11T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 0
+
+    # ...and shift_forward pushes the adjusted wall time past the gap.
+    resp = post_business(
+        {
+            "timezone": "America/New_York",
+            "start_local": "2025-03-08T02:30:00",
+            "weekend_days": [6],
+            "dst_policy": {"gap": "shift_forward"},
+            "interval_start": "2025-03-07T00:00:00Z",
+            "interval_end": "2025-03-11T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    assert [(o["local"], o["utc"], o["originals"]) for o in resp.json()["occurrences"]] == [
+        ("2025-03-09T03:30:00", "2025-03-09T07:30:00Z", ["2025-03-08T02:30:00"]),
+    ]
+
+
+def test_business_fold_returns_both_passes_after_adjustment(api):
+    # Saturday Nov 1 01:30 moves (weekend_days=[6]) to Sunday Nov 2, where
+    # 01:30 is the repeated fall-back wall time: both folds are returned.
+    resp = post_business(
+        {
+            "timezone": "America/New_York",
+            "start_local": "2025-11-01T01:30:00",
+            "weekend_days": [6],
+            "interval_start": "2025-11-01T00:00:00Z",
+            "interval_end": "2025-11-03T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    occ = resp.json()["occurrences"]
+    assert [(o["utc"], o["fold"], o["originals"]) for o in occ] == [
+        ("2025-11-02T05:30:00Z", 0, ["2025-11-01T01:30:00"]),
+        ("2025-11-02T06:30:00Z", 1, ["2025-11-01T01:30:00"]),
+    ]
+
+
+def test_business_long_holiday_bridge_near_window_edge(api):
+    # Fri Jan 3 is a holiday, followed by the weekend and Mon-Fri holidays
+    # (Jan 3..10, then Jan 11/12 weekend): the raw instance moves all the way
+    # to Mon Jan 13 - ten days away, beyond the fixed 2-day window margin,
+    # which the adaptive calendar margin must cover.
+    holidays = [f"2025-01-{d:02d}" for d in range(3, 11)]
+
+    resp = post_business(
+        {
+            "timezone": "UTC",
+            "start_local": "2025-01-03T09:00:00",
+            "holidays": holidays,
+            "interval_start": "2025-01-01T00:00:00Z",
+            "interval_end": "2025-01-04T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    # The adjusted instant (Jan 13) falls outside the UTC query window.
+    assert resp.json()["count"] == 0
+
+    resp = post_business(
+        {
+            "timezone": "UTC",
+            "start_local": "2025-01-03T09:00:00",
+            "holidays": holidays,
+            "interval_start": "2025-01-01T00:00:00Z",
+            "interval_end": "2025-01-14T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    assert [(o["local"], o["originals"]) for o in resp.json()["occurrences"]] == [
+        ("2025-01-13T09:00:00", ["2025-01-03T09:00:00"]),
+    ]
+
+
+def test_business_invalid_weekend_days_rejected(api):
+    base = {
+        "timezone": "UTC",
+        "start_local": "2025-01-01T00:00:00",
+        "interval_start": "2025-01-01T00:00:00Z",
+        "interval_end": "2025-02-01T00:00:00Z",
+    }
+    for bad in ([], [0], [8], [1, 2, 3, 4, 5, 6, 7]):
+        resp = post_business({**base, "weekend_days": bad})
+        assert resp.status_code in (400, 422), bad
+        assert resp.json()["error"]["code"] in (
+            "invalid_business_calendar",
+            "validation_error",
+        )
+
+
+def test_business_unknown_convention_is_validation_error(api):
+    resp = post_business(
+        {
+            "timezone": "UTC",
+            "start_local": "2025-01-01T00:00:00",
+            "business_day_convention": "later",
+            "interval_start": "2025-01-01T00:00:00Z",
+            "interval_end": "2025-02-01T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"

@@ -17,11 +17,20 @@ The policy applies to DTSTART, RRULE and RDATE. EXDATE matches the *original*
 local wall time per RFC 5545 (even when the occurrence was shifted), and the
 UTC instants produced by the RRULE always take precedence over RDATE for the
 same instant, including collisions created by a gap shift.
+
+``expand_business_occurrences`` adds a business-day adjustment stage in front
+of the DST resolution: each raw wall-clock instance is first moved to a
+business day (skipping weekends and holidays) under the ``following``,
+``preceding`` or ``modified_following`` convention, keeping its hour, minute,
+second and sub-second part. Several raw instances may land on the same UTC
+instant after adjustment; such instances are merged and their original wall
+times listed in ``originals``. EXDATE still matches the *unadjusted* wall
+times.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone, tzinfo
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -30,6 +39,7 @@ from dateutil.rrule import rrulestr
 
 from .errors import (
     APIError,
+    invalid_business_calendar,
     invalid_datetime,
     invalid_dst_policy,
     invalid_interval,
@@ -340,6 +350,59 @@ def _make_output(
     }
 
 
+def _generate_rule_walls(
+    raw_rule: str,
+    dtstart: datetime,
+    zone: tzinfo,
+    lo_wall: datetime,
+    hi_wall: datetime,
+    max_occurrences: int,
+) -> list[datetime]:
+    """Generate raw RRULE wall times inside ``[lo_wall, hi_wall]``.
+
+    dateutil generates instances from DTSTART one by one, so a rule starting
+    long before the window (e.g. FREQ=SECONDLY in year 2000) would have
+    millions of instances to skip. The total number of generated instances is
+    capped as well as the number kept.
+    """
+    rule, dtstart_microsecond = build_rrule(raw_rule, dtstart, zone)
+    rule_walls: list[datetime] = []
+    scan_budget = max_occurrences * 5
+    scanned = 0
+    try:
+        for wall in rule:
+            # rrulestr parses DTSTART in whole seconds; restore the
+            # sub-second part of the requested start on every instance.
+            wall = wall.replace(microsecond=dtstart_microsecond)
+            scanned += 1
+            if scanned > scan_budget:
+                raise APIError(
+                    code="too_many_occurrences",
+                    message=(
+                        f"RRULE requires scanning more than {scan_budget} instances to "
+                        "reach the query window; move start_local closer or add COUNT/UNTIL."
+                    ),
+                )
+            if wall < lo_wall:
+                continue
+            if wall > hi_wall:
+                break
+            if len(rule_walls) >= max_occurrences:
+                raise APIError(
+                    code="too_many_occurrences",
+                    message=(
+                        f"RRULE expands to more than {max_occurrences} instances in the "
+                        "query window; narrow the interval or add COUNT/UNTIL."
+                    ),
+                )
+            rule_walls.append(wall)
+    except APIError:
+        raise
+    except (ValueError, OverflowError, TypeError) as exc:
+        raise invalid_rrule(str(exc) or "could not evaluate rule") from None
+    return rule_walls
+
+
 def expand_occurrences(payload: dict, max_occurrences: int = DEFAULT_MAX_OCCURRENCES) -> dict:
     """Expand a recurrence request into occurrences inside the query interval."""
     tz_name = payload["timezone"]
@@ -396,45 +459,9 @@ def expand_occurrences(payload: dict, max_occurrences: int = DEFAULT_MAX_OCCURRE
 
     raw_rule = payload.get("rrule")
     if raw_rule:
-        rule, dtstart_microsecond = build_rrule(raw_rule, dtstart, zone)
-        rule_walls: list[datetime] = []
-        # dateutil generates instances from DTSTART one by one, so a rule
-        # starting long before the window (e.g. FREQ=SECONDLY in year 2000)
-        # would have millions of instances to skip. Cap the total number of
-        # generated instances as well as the number kept.
-        scan_budget = max_occurrences * 5
-        scanned = 0
-        try:
-            for wall in rule:
-                # rrulestr parses DTSTART in whole seconds; restore the
-                # sub-second part of the requested start on every instance.
-                wall = wall.replace(microsecond=dtstart_microsecond)
-                scanned += 1
-                if scanned > scan_budget:
-                    raise APIError(
-                        code="too_many_occurrences",
-                        message=(
-                            f"RRULE requires scanning more than {scan_budget} instances to "
-                            "reach the query window; move start_local closer or add COUNT/UNTIL."
-                        ),
-                    )
-                if wall < lo_wall:
-                    continue
-                if wall > hi_wall:
-                    break
-                if len(rule_walls) >= max_occurrences:
-                    raise APIError(
-                        code="too_many_occurrences",
-                        message=(
-                            f"RRULE expands to more than {max_occurrences} instances in the "
-                            "query window; narrow the interval or add COUNT/UNTIL."
-                        ),
-                    )
-                rule_walls.append(wall)
-        except APIError:
-            raise
-        except (ValueError, OverflowError, TypeError) as exc:
-            raise invalid_rrule(str(exc) or "could not evaluate rule") from None
+        rule_walls = _generate_rule_walls(
+            raw_rule, dtstart, zone, lo_wall, hi_wall, max_occurrences
+        )
         for wall in rule_walls:
             add(wall, "rrule")
     else:
@@ -453,5 +480,231 @@ def expand_occurrences(payload: dict, max_occurrences: int = DEFAULT_MAX_OCCURRE
     occurrences = [
         _make_output(naive_local, aware, fold, source)
         for _instant, (naive_local, aware, fold, source) in ordered
+    ]
+    return {"timezone": tz_name, "count": len(occurrences), "occurrences": occurrences}
+
+
+# ---------------------------------------------------------------- business days
+
+
+_BUSINESS_CONVENTIONS = ("following", "preceding", "modified_following")
+
+
+def parse_business_calendar(payload: dict, zone: tzinfo) -> tuple[set[date], frozenset[int], str]:
+    """Validate and parse the business-calendar fields.
+
+    Returns ``(holidays, weekend_iso_days, convention)``. Holidays may be
+    dates or date-times; aware values are converted to the zone's wall date.
+    """
+    convention = payload.get("business_day_convention", "following")
+    if convention not in _BUSINESS_CONVENTIONS:
+        raise invalid_business_calendar(
+            f"'business_day_convention' must be one of {list(_BUSINESS_CONVENTIONS)}"
+        )
+
+    weekend = payload.get("weekend_days")
+    if weekend is None:
+        weekend = {6, 7}
+    if not isinstance(weekend, (list, tuple)) or not weekend:
+        raise invalid_business_calendar("'weekend_days' must be a non-empty list of ISO weekdays")
+    weekend_days: set[int] = set()
+    for day in weekend:
+        if not isinstance(day, int) or isinstance(day, bool) or not 1 <= day <= 7:
+            raise invalid_business_calendar(
+                "'weekend_days' values must be integers between 1 (Monday) and 7 (Sunday)"
+            )
+        weekend_days.add(day)
+    if len(weekend_days) >= 7:
+        raise invalid_business_calendar("at least one ISO weekday must remain a business day")
+
+    holidays: set[date] = set()
+    for value in payload.get("holidays") or []:
+        if not isinstance(value, str):
+            raise invalid_business_calendar("'holidays' entries must be ISO-8601 date strings")
+        wall = parse_local_wall(value, "holidays", zone)
+        holidays.add(wall.date())
+    return holidays, frozenset(weekend_days), convention
+
+
+def _longest_nonbusiness_run(
+    holidays: set[date], weekend_days: frozenset[int]
+) -> int:
+    """Length of the longest consecutive non-business-day run in the calendar.
+
+    Weekends alone produce a fixed run (e.g. 2 for Sat/Sun); holidays can
+    bridge or extend such runs. Scans a finite window around every holiday,
+    which is sufficient because outside it the weekend pattern repeats without
+    any holiday to break or extend it.
+    """
+    if not holidays:
+        # Pure repeating week: scan two weeks so a block wrapping the
+        # Sunday/Monday boundary (e.g. weekend [7, 1]) is counted.
+        run = longest = 0
+        for iso in list(range(1, 8)) * 2:
+            run = run + 1 if iso in weekend_days else 0
+            longest = max(longest, run)
+        return longest
+
+    span = max(len(holidays) + 14, 31)
+    lo = min(holidays) - timedelta(days=span)
+    hi = max(holidays) + timedelta(days=span)
+    run = longest = 0
+    day = lo
+    while day <= hi:
+        if day in holidays or day.isoweekday() in weekend_days:
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+        day += timedelta(days=1)
+    return longest
+
+
+def adjust_to_business_day(
+    wall: datetime,
+    holidays: set[date],
+    weekend_days: frozenset[int],
+    convention: str,
+) -> datetime:
+    """Move the *date* of ``wall`` onto a business day, keeping time of day.
+
+    * ``following``: forward to the next business day (no adjustment when the
+      raw day is already a business day);
+    * ``preceding``: backward to the previous business day;
+    * ``modified_following``: like ``following``, but when the forward move
+      crosses into a different calendar month it is moved backward instead.
+    """
+    day = wall.date()
+
+    def is_business(d: date) -> bool:
+        return d not in holidays and d.isoweekday() not in weekend_days
+
+    if convention == "following":
+        while not is_business(day):
+            day += timedelta(days=1)
+    elif convention == "preceding":
+        while not is_business(day):
+            day -= timedelta(days=1)
+    else:  # modified_following
+        original_month = day.month
+        while not is_business(day):
+            day += timedelta(days=1)
+        if day.month != original_month:
+            day = wall.date()
+            while not is_business(day):
+                day -= timedelta(days=1)
+    return datetime.combine(day, wall.time())
+
+
+def _make_business_output(
+    naive_local: datetime,
+    aware: datetime,
+    fold: int,
+    originals: list[str],
+) -> dict:
+    output = _make_output(naive_local, aware, fold, source="rrule")
+    output.pop("source", None)
+    output["originals"] = originals
+    return output
+
+
+def expand_business_occurrences(
+    payload: dict, max_occurrences: int = DEFAULT_MAX_OCCURRENCES
+) -> dict:
+    """Expand a recurrence request, adjusting raw instances to business days.
+
+    The raw wall-clock instances come from the same DTSTART/RRULE/RDATE set as
+    :func:`expand_occurrences`. Each one is first moved to a business day with
+    its time of day preserved, then resolved to a real instant with the
+    request's ``dst_policy``. Raw instances that resolve to the same UTC
+    instant after adjustment are merged and their original wall times listed.
+    EXDATE always matches the *unadjusted* raw wall time.
+    """
+    tz_name = payload["timezone"]
+    zone = get_zone(tz_name)
+
+    lo_utc = parse_aware_bound(payload["interval_start"], "interval_start")
+    hi_utc = parse_aware_bound(payload["interval_end"], "interval_end")
+    if lo_utc >= hi_utc:
+        raise invalid_interval("interval_start must be strictly before interval_end")
+
+    dtstart = parse_local_wall(payload["start_local"], "start_local", zone)
+
+    gap_policy, fold_policy = parse_dst_policy(payload.get("dst_policy"))
+    holidays, weekend_days, convention = parse_business_calendar(payload, zone)
+
+    exdates = {
+        parse_local_wall(v, "exdate", zone)
+        for v in payload.get("exdate") or []
+    }
+
+    rdates: set[datetime] = set()
+    for v in payload.get("rdate") or []:
+        wall = parse_local_wall(v, "rdate", zone)
+        if wall not in exdates:
+            rdates.add(wall)
+
+    # Adjustment can move an instance several days away from its raw date
+    # (long holiday bridges, e.g. Golden Week): widen the raw-instance window
+    # by the longest non-business run actually present in this calendar.
+    margin = timedelta(days=_longest_nonbusiness_run(holidays, weekend_days) + 2)
+    lo_wall = lo_utc.astimezone(zone).replace(tzinfo=None) - _WINDOW_MARGIN - margin
+    hi_wall = hi_utc.astimezone(zone).replace(tzinfo=None) + _WINDOW_MARGIN + margin
+
+    raw_walls: list[datetime] = []
+    raw_rule = payload.get("rrule")
+    if raw_rule:
+        raw_walls.extend(
+            _generate_rule_walls(raw_rule, dtstart, zone, lo_wall, hi_wall, max_occurrences)
+        )
+        if len(raw_walls) > max_occurrences:
+            raise APIError(
+                code="too_many_occurrences",
+                message=(
+                    f"RRULE expands to more than {max_occurrences} instances in the "
+                    "query window; narrow the interval or add COUNT/UNTIL."
+                ),
+            )
+    else:
+        # Without an RRULE the recurrence set still contains DTSTART (RFC 5545).
+        raw_walls.append(dtstart)
+
+    if len(rdates) > max_occurrences:
+        raise APIError(
+            code="too_many_occurrences",
+            message=f"More than {max_occurrences} RDATE entries were supplied.",
+        )
+    raw_walls.extend(rdates)
+
+    # instant -> (adjusted wall, aware, fold, set of original raw wall times)
+    chosen: dict[datetime, tuple[datetime, datetime, int, set[datetime]]] = {}
+    for raw in raw_walls:
+        # EXDATE matches the unadjusted original wall time, before the
+        # business-day move and before any DST resolution.
+        if raw in exdates:
+            continue
+        if not (lo_wall <= raw <= hi_wall):
+            continue
+        adjusted = adjust_to_business_day(raw, holidays, weekend_days, convention)
+        for local_wall, aware, fold in resolve_wall(
+            adjusted, zone, gap=gap_policy, fold=fold_policy
+        ):
+            instant = aware.astimezone(timezone.utc)
+            if not (lo_utc <= instant < hi_utc):
+                continue
+            if instant in chosen:
+                chosen[instant][3].add(raw)
+                continue
+            chosen[instant] = (local_wall, aware, fold, {raw})
+
+    ordered = sorted(chosen.items(), key=lambda item: (item[0], item[1][2]))
+    occurrences = [
+        _make_business_output(
+            naive_local,
+            aware,
+            fold,
+            sorted(original.isoformat() for original in originals),
+        )
+        for _instant, (naive_local, aware, fold, originals) in ordered
     ]
     return {"timezone": tz_name, "count": len(occurrences), "occurrences": occurrences}

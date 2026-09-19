@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
 
 class DstPolicy(BaseModel):
@@ -112,6 +112,73 @@ class OccurrenceResponse(BaseModel):
     timezone: str
     count: int
     occurrences: list[Occurrence]
+
+
+class BusinessOccurrenceRequest(OccurrenceRequest):
+    """Body of ``POST /business-occurrences``.
+
+    Reuses the DTSTART/RRULE/RDATE/EXDATE fields, the query interval and the
+    ``dst_policy``. Before DST resolution every raw wall-clock instance is
+    moved to a business day (keeping its hour/minute/second) according to
+    ``business_day_convention``, skipping the ISO weekdays listed in
+    ``weekend_days`` and the dates listed in ``holidays``.
+    """
+
+    holidays: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Non-business dates. ISO-8601 date (e.g. '2025-01-01') or date-time; "
+            "date-time values use their local wall date in the requested timezone."
+        ),
+    )
+    weekend_days: list[StrictInt] = Field(
+        default_factory=lambda: [6, 7],
+        description=(
+            "ISO 8601 weekdays that are non-business days: 1=Monday ... 7=Sunday. "
+            "Defaults to [6, 7] (Saturday, Sunday)."
+        ),
+    )
+    business_day_convention: Literal["following", "preceding", "modified_following"] = Field(
+        default="following",
+        description=(
+            "How a raw instance landing on a non-business day is moved: "
+            "'following' moves forward to the next business day; 'preceding' moves "
+            "backward to the previous one; 'modified_following' moves forward but "
+            "switches to backward when the move crosses the month boundary."
+        ),
+    )
+
+
+class BusinessOccurrence(BaseModel):
+    local: str = Field(
+        ...,
+        description=(
+            "Adjusted wall-clock time in the requested zone (ISO-8601), on a business day."
+        ),
+    )
+    utc: str = Field(..., description="UTC instant with trailing 'Z' (ISO-8601).")
+    utc_offset: str = Field(
+        ...,
+        description="UTC offset at that instant, formatted as '+HH:MM'/'-HH:MM'.",
+    )
+    dst: bool = Field(..., description="Whether daylight-saving time is in effect at that instant.")
+    fold: Literal[0, 1] = Field(
+        ...,
+        description="0 for a regular/earlier instant; 1 for the second pass of a repeated wall time.",
+    )
+    originals: list[str] = Field(
+        ...,
+        description=(
+            "Original raw wall-clock times (before the business-day adjustment) that "
+            "all landed on this same UTC instant; sorted and deduplicated."
+        ),
+    )
+
+
+class BusinessOccurrenceResponse(BaseModel):
+    timezone: str
+    count: int
+    occurrences: list[BusinessOccurrence]
 
 
 class HealthResponse(BaseModel):

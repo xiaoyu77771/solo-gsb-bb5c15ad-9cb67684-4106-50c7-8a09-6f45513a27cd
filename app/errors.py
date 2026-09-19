@@ -64,3 +64,10 @@ def invalid_dst_policy(message: str) -> APIError:
         message=f"Invalid dst_policy: {message}",
         status_code=422,
     )
+
+
+def invalid_business_calendar(message: str) -> APIError:
+    return APIError(
+        code="invalid_business_calendar",
+        message=f"Invalid business calendar: {message}",
+    )

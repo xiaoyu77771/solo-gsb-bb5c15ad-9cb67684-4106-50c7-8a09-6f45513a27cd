@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    image: recurrence-api:latest
+    ports:
+      - "8000:8000"
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+      # Maximum RRULE instances evaluated per request before a
+      # "too_many_occurrences" error is returned.
+      APP_MAX_OCCURRENCES: "10000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+os.getenv('APP_PORT','8000')+'/health', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

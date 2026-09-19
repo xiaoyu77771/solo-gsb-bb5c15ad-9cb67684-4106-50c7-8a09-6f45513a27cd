@@ -90,6 +90,42 @@ class OccurrenceRequest(BaseModel):
     )
 
 
+class BusinessOccurrenceRequest(OccurrenceRequest):
+    """Body of ``POST /business-occurrences``.
+
+    Adds the business-day calendar to :class:`OccurrenceRequest`: ``holidays``
+    are non-business dates, ``weekend_days`` the weekly non-business weekdays
+    (0=Monday … 6=Sunday, also accepts iCal abbreviations such as ``"SA"``),
+    and ``business_day_convention`` selects how each raw wall-clock instance
+    is moved onto a business day.
+    """
+
+    holidays: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Non-business dates (and/or date-times; only the date part in the "
+            "requested timezone is used), e.g. ['2025-01-01']."
+        ),
+    )
+    weekend_days: list[int | str] = Field(
+        default_factory=lambda: [5, 6],
+        description=(
+            "Non-business weekdays: integers 0 (Monday) … 6 (Sunday), or iCal "
+            "abbreviations 'MO'..'SU'. Defaults to [5, 6] (Saturday, Sunday)."
+        ),
+    )
+    business_day_convention: Literal["following", "preceding", "modified_following"] = Field(
+        default="following",
+        description=(
+            "How to move a raw instance onto a business day, keeping its "
+            "hour/minute/second: 'following' moves forward; 'preceding' moves "
+            "backward; 'modified_following' moves forward unless that crosses "
+            "into a different calendar month, in which case it moves backward "
+            "instead. The time-of-day is preserved by every convention."
+        ),
+    )
+
+
 class Occurrence(BaseModel):
     local: str = Field(..., description="Wall-clock time in the requested zone (ISO-8601).")
     utc: str = Field(..., description="UTC instant with trailing 'Z' (ISO-8601).")
@@ -112,6 +148,25 @@ class OccurrenceResponse(BaseModel):
     timezone: str
     count: int
     occurrences: list[Occurrence]
+
+
+class BusinessOccurrence(Occurrence):
+    originals: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Original local wall-clock instances (before the business-day "
+            "adjustment) that were merged into this UTC instant, ISO-8601, "
+            "sorted and de-duplicated. Contains the adjusted wall time itself "
+            "when no other raw instance merged into it."
+        ),
+    )
+
+
+class BusinessOccurrenceResponse(BaseModel):
+    timezone: str
+    count: int
+    business_day_convention: Literal["following", "preceding", "modified_following"]
+    occurrences: list[BusinessOccurrence]
 
 
 class HealthResponse(BaseModel):

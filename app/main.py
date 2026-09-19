@@ -10,9 +10,19 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .engine import DEFAULT_MAX_OCCURRENCES, expand_occurrences
+from .engine import (
+    DEFAULT_MAX_OCCURRENCES,
+    expand_business_occurrences,
+    expand_occurrences,
+)
 from .errors import APIError
-from .schemas import OccurrenceRequest, OccurrenceResponse, HealthResponse
+from .schemas import (
+    BusinessOccurrenceRequest,
+    BusinessOccurrenceResponse,
+    HealthResponse,
+    OccurrenceRequest,
+    OccurrenceResponse,
+)
 
 app = FastAPI(
     title="Recurrence Expansion API",
@@ -87,3 +97,27 @@ async def health() -> HealthResponse:
 async def occurrences(request: OccurrenceRequest) -> OccurrenceResponse:
     result = expand_occurrences(request.model_dump(), max_occurrences=_max_occurrences())
     return OccurrenceResponse(**result)
+
+
+@app.post(
+    "/business-occurrences",
+    response_model=BusinessOccurrenceResponse,
+    tags=["occurrences"],
+    summary="Expand a recurrence rule onto business days within a query interval",
+    description=(
+        "Like `/occurrences`, but every raw wall-clock instance (DTSTART/RRULE/RDATE) "
+        "is first moved to a business day while keeping its hour/minute/second, then "
+        "resolved to a real instant with `dst_policy`. Non-business days are given by "
+        "`holidays` and `weekend_days` (defaults to Saturday/Sunday); "
+        "`business_day_convention` is `following` (default), `preceding` or "
+        "`modified_following` (following that crosses into another month goes backward "
+        "instead). Raw instances merging into the same UTC instant are combined into one "
+        "occurrence whose `originals` lists them; EXDATE always matches the raw, "
+        "pre-adjustment local wall time."
+    ),
+)
+async def business_occurrences(request: BusinessOccurrenceRequest) -> BusinessOccurrenceResponse:
+    result = expand_business_occurrences(
+        request.model_dump(), max_occurrences=_max_occurrences()
+    )
+    return BusinessOccurrenceResponse(**result)
